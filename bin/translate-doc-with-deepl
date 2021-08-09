@@ -1,0 +1,142 @@
+#!/usr/bin/env ruby
+#-*-ruby-*-
+
+require "bundler/setup"
+Bundler.require
+require "yaml"
+
+class TranslateDocWithDeepl < Thor
+  module Helper
+    def setup
+      @api_url = "https://api.deepl.com/v2/document"
+      @api_key = ENV["DEEPL_API_KEY"] or raise Thor::Error, "Give me DEEPL_API_KEY envvar."
+    end
+
+    def with_faraday_connection(is_binary_response: false, &block)
+      conn = Faraday.new(url: @api_url) do |faraday|
+        faraday.request :multipart
+        faraday.request :url_encoded
+        unless is_binary_response
+          faraday.response :json
+        end
+        faraday.response :logger if options[:verbose]
+        faraday.response :raise_error
+        faraday.adapter Faraday.default_adapter
+      end
+
+      begin
+        yield conn
+      rescue Faraday::Error => ex
+        raise Thor::Error, "Error during API call: #{ex} (#{ex.response})"
+      end
+    end
+
+    def create_status_file_name(docfile)
+      "#{docfile}.dtstat.tmp"
+    end
+  end
+  include Helper
+
+  class_option :verbose, aliases: %w"-v", required: false, type: :boolean, desc: ""
+
+  desc "upload FILE", "Upload the document"
+  method_option :source_lang, aliases: %w"-s", default: "auto", type: :string, desc: "Source language"
+  method_option :target_lang, aliases: %w"-t", required: true, type: :string, desc: "Target language"
+
+  def upload(file)
+    setup
+
+    source_lang = options[:source_lang]
+    target_lang = options[:target_lang]
+    status_file = create_status_file_name(file)
+    filename = File.basename(file)
+
+    resp = with_faraday_connection do |conn|
+      file = Faraday::UploadIO.new(
+          file,
+          "application/octet-stream",
+          filename
+      )
+
+      payload = {
+          auth_key: @api_key,
+          **(source_lang == "auto" ? {} : {source_lang: source_lang}),
+          target_lang: target_lang,
+          file: file
+      }
+
+      conn.post('.', payload)
+    end
+
+    status_data = {
+        "filename" => filename,
+        "target_lang" => target_lang,
+    }.merge(resp.body)
+
+    IO.write(status_file, YAML.dump(status_data))
+
+    say "Created #{status_file}"
+  end
+
+  desc "get UPLOADED_DOCFILE", "Download the translated document"
+  method_option :out_file, aliases: %w"-o", required: false, type: :string, desc: "Downloaded file"
+  method_option :timeout, aliases: %w"-T", default: 60, type: :numeric, desc: "Translation timeout"
+
+  def get(docfile)
+    setup
+
+    status_file = create_status_file_name(docfile)
+    status_data = YAML.load(IO.read(status_file))
+
+    document_id = status_data["document_id"]
+    document_key = status_data["document_key"]
+    target_lang = status_data["target_lang"].upcase
+    filename = status_data["filename"]
+
+    # Wait for translation.
+    with_faraday_connection do |conn|
+      (0..options[:timeout]).find { |i|
+        say "Waiting for translation ... (#{i} seconds passed)"
+        sleep 1 if i > 0
+
+        resp = conn.post(document_id, {
+            auth_key: @api_key,
+            document_key: document_key
+        })
+        status = resp.body["status"]
+
+        if status == "done"
+          true
+        elsif status == "queued" || status == "translating"
+          false
+        else
+          raise Thor::Error, "Translation failed: status=#{status}"
+        end
+      } or raise Thor::Error, "Translation timeout."
+    end
+
+    # Download the file.
+    resp = with_faraday_connection(is_binary_response: true) do |conn|
+      conn.post("#{document_id}/result", {
+          auth_key: @api_key,
+          document_key: document_key
+      })
+    end
+
+    output_filename =
+        options[:out_file] ||
+            "#{File.basename(docfile, '.*')}-#{target_lang}#{File.extname(docfile)}"
+
+    say "Downloading to #{output_filename} ..."
+    IO.write(output_filename, resp.body)
+    say "Done."
+
+    File.unlink(status_file)
+  end
+
+  def self.exit_on_failure?
+    true
+  end
+
+  start(ARGV)
+end
